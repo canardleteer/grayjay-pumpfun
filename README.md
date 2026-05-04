@@ -1,10 +1,13 @@
 # grayjay-pumpfun
 
 GrayJay source plugin for **live** token streams on
-**[pump.fun/live](https://pump.fun/live)**.
+**[pump.fun](https://pump.fun)** (live directory data comes from the public
+**`frontend-api-v3`** **`/coins/currently-live`** JSON, not from the
+**[`/live`](https://pump.fun/live)** page, which can mix in **clips and other
+non-live** rows).
 
-**Read-only:** public HTML and REST APIs plus HLS from `clips.pump.fun` (no wallet,
-no trading).
+**Read-only:** public HTML (coin pages for HLS where needed) and REST APIs plus HLS
+from `clips.pump.fun` (no wallet, no trading).
 
 **Disclaimer:** This plugin is **not affiliated with, endorsed by, or sponsored
 by** [pump.fun](https://pump.fun) or its operators. It is an independent GrayJay
@@ -37,15 +40,37 @@ Deployment** in
 
 ## Subscriptions and channel feeds
 
-You can **subscribe** to a creator in GrayJay using their **`https://pump.fun/profile/<wallet>`** URL. The channel feed lists **all** of that wallet’s coins from the public API (live first, then newest by creation time), with **pagination** (`limit` / `offset`), so the feed stays useful even when nothing is live.
+You can **subscribe** to a creator in GrayJay using their
+**`https://pump.fun/profile/<wallet>`** URL. The channel feed lists **all** of
+that wallet’s coins from the public API (live first, then newest by creation
+time), with **pagination** (`limit` / `offset`), so the feed stays useful even
+when nothing is live.
 
 ## Recorded / historical video
 
-If pump.fun leaves **non-live** HLS manifests on a coin page (e.g. `master_playlist` or other `.m3u8` under `clips.pump.fun` that are not `_live` playlists), the plugin will try to play them as **recorded** streams. There is **no** separate public `clips-api` host in use (it did not resolve in testing); anything beyond what appears in **coin HTML** may not be available.
+If pump.fun leaves **non-live** HLS manifests on a coin page (e.g.
+`master_playlist` or other `.m3u8` under `clips.pump.fun` that are not `_live`
+playlists), the plugin will try to play them as **recorded** streams. **Recorded
+VOD only exists when those playlist URLs appear in the public coin HTML** the
+app fetches; there is no separate authenticated clips API in this plugin. There
+is **no** separate public `clips-api` host in use (it did not resolve in
+testing).
 
 ## Limitations
 
-**Search** and **search channels** still only reflect **currently live** rows from `/live` (no global pump.fun user index). **Live chat** is not implemented. **`getUserSubscriptions`** returns an empty list — pump.fun login is not part of this plugin; subscriptions are whatever channel URLs GrayJay stores when you add or subscribe to a profile.
+**Search** and **search channels** still only reflect **currently live** rows
+from **`GET https://frontend-api-v3.pump.fun/coins/currently-live`** (no global
+pump.fun user index). **Live chat** for **live** coins uses GrayJay’s
+live-event overlay (`getLiveEvents`): Socket.IO to `livechat.pump.fun` (same
+protocol as the website). **`getComments`** also receives a live stream of
+`PlatformComment` rows for live coins (shared backend with the overlay). If
+GrayJay’s **embedded live chat window** is enabled, **`getLiveChatWindow`**
+loads the same coin page in a WebView (native pump.fun UI).
+**`getContentRecommendations`** lists other coins from the **same creator**
+(public `…/coins?creator=…`). Chat is read-only and may break if pump.fun
+changes their socket protocol. **`getUserSubscriptions`** returns an empty
+list — pump.fun login is not part of this plugin; subscriptions are whatever
+channel URLs GrayJay stores when you add or subscribe to a profile.
 
 ## Links
 

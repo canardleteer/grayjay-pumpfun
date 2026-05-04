@@ -8,6 +8,305 @@ var CLIPS_CDN = "https://clips.pump.fun";
 var liveCache = { t: 0, rows: null, byMint: null };
 var LIVE_CACHE_TTL_MS = 45000;
 
+// --- pump.fun live chat (Socket.IO / Engine.IO over WebSocket, same as pump.fun web) ---
+var LIVECHAT_WS =
+	"wss://livechat.pump.fun/socket.io/?EIO=4&transport=websocket";
+var CHAT_MAX_QUEUE = 400;
+var chatEngines = {};
+
+function parseIsoMs(iso) {
+	try {
+		var t = Date.parse(iso);
+		return isNaN(t) ? -1 : t;
+	} catch (e) {
+		return -1;
+	}
+}
+
+function parseSocketIOPayload(data) {
+	var c = data.charAt(0);
+	if (c === "0") {
+		return { kind: "ns", data: JSON.parse(data.substring(1)) };
+	}
+	if (c === "2") {
+		var i = 1;
+		while (
+			i < data.length &&
+			data.charCodeAt(i) >= 48 &&
+			data.charCodeAt(i) <= 57
+		) {
+			i++;
+		}
+		var jsonStr = data.substring(i);
+		var arr = JSON.parse(jsonStr);
+		return { kind: "event", name: arr[0], args: arr.slice(1) };
+	}
+	if (c === "3") {
+		var j = 1;
+		while (
+			j < data.length &&
+			data.charCodeAt(j) >= 48 &&
+			data.charCodeAt(j) <= 57
+		) {
+			j++;
+		}
+		var ackId = parseInt(data.substring(1, j), 10);
+		var body = JSON.parse(data.substring(j));
+		return { kind: "ack", ackId: ackId, data: body };
+	}
+	return null;
+}
+
+function handleEngineText(state, raw) {
+	var t = raw.charAt(0);
+	var rest = raw.substring(1);
+	if (t === "2") {
+		if (state.sock) state.sock.send("3");
+		return;
+	}
+	if (t === "3") return;
+	if (t === "0") {
+		if (state.sock && !state.sent40) {
+			state.sock.send("40");
+			state.sent40 = true;
+		}
+		return;
+	}
+	if (t !== "4") return;
+	var inner = rest;
+	var p = parseSocketIOPayload(inner);
+	if (!p) return;
+	if (p.kind === "ns") {
+		if (!state.nsReady) {
+			state.nsReady = true;
+			state.emitJoinAndHistory();
+		}
+		return;
+	}
+	if (p.kind === "ack") {
+		if (p.ackId === 0 && Array.isArray(p.data) && p.data.length) {
+			var hist = p.data[0];
+			if (Array.isArray(hist)) state.applyHistoryRows(hist);
+		}
+		return;
+	}
+	if (p.kind === "event") {
+		state.onSocketEvent(p.name, p.args);
+	}
+}
+
+function PumpFunChatEngine(roomId, coinUrl) {
+	this.roomId = roomId;
+	this.coinUrl = coinUrl;
+	this.sock = null;
+	this.sent40 = false;
+	this.nsReady = false;
+	this.joined = false;
+	this.liveOut = [];
+	this.commentOut = [];
+	this.lastViewerCount = null;
+	this.err = null;
+}
+PumpFunChatEngine.prototype.trimQueues = function () {
+	while (this.liveOut.length > CHAT_MAX_QUEUE) this.liveOut.shift();
+	while (this.commentOut.length > CHAT_MAX_QUEUE) this.commentOut.shift();
+};
+PumpFunChatEngine.prototype.applyHistoryRows = function (rows) {
+	for (var i = 0; i < rows.length; i++) {
+		this.pushOneMessageRow(rows[i], true);
+	}
+	this.trimQueues();
+};
+PumpFunChatEngine.prototype.pushOneMessageRow = function (row, isHistory) {
+	if (!row || row.messageType === "SYSTEM") return;
+	var name = row.username || "anon";
+	var msg = row.message || "";
+	var thumb = row.profile_image || "";
+	var t = parseIsoMs(row.timestamp);
+	var ev = new LiveEventComment(name, msg, thumb, "", []);
+	if (t > 0) ev.time = t;
+	this.liveOut.push(ev);
+	var authorId = new PlatformID(
+		PLATFORM,
+		row.userAddress || name,
+		pluginId()
+	);
+	var prof = row.userAddress
+		? BASE_URL + "/profile/" + row.userAddress
+		: this.coinUrl;
+	this.commentOut.push(
+		new PlatformComment({
+			contextUrl: this.coinUrl,
+			author: new PlatformAuthorLink(
+				authorId,
+				name,
+				prof,
+				thumb,
+				null
+			),
+			message: msg,
+			date:
+				t > 0
+					? Math.floor(t / 1000)
+					: Math.floor(Date.now() / 1000),
+			rating: new RatingLikes(0),
+			replyCount: 0,
+			context: { history: !!isHistory },
+		})
+	);
+	this.trimQueues();
+};
+PumpFunChatEngine.prototype.onSocketEvent = function (name, args) {
+	if (name === "newMessage" && args.length) {
+		var payload = args[0];
+		var rows = Array.isArray(payload) ? payload : [payload];
+		for (var i = 0; i < rows.length; i++) {
+			this.pushOneMessageRow(rows[i], false);
+		}
+		return;
+	}
+	if (name === "viewerCount" && args[0] && args[0].count != null) {
+		var c = args[0].count;
+		if (this.lastViewerCount !== c) {
+			this.lastViewerCount = c;
+			this.liveOut.push(new LiveEventViewCount(c));
+		}
+	}
+};
+PumpFunChatEngine.prototype.emitJoinAndHistory = function () {
+	if (!this.sock || !this.nsReady || this.joined) return;
+	this.joined = true;
+	this.sock.send(
+		'42["joinRoom",' + JSON.stringify({ roomId: this.roomId }) + "]"
+	);
+	this.sock.send(
+		'420["getMessageHistory",' +
+			JSON.stringify({
+				roomId: this.roomId,
+				before: null,
+				limit: 50,
+			}) +
+			"]"
+	);
+};
+PumpFunChatEngine.prototype.attachSocket = function () {
+	var self = this;
+	if (this.sock) return;
+	this.sent40 = false;
+	this.nsReady = false;
+	this.joined = false;
+	var sk = http.socket(
+		LIVECHAT_WS,
+		{
+			Origin: BASE_URL,
+			"User-Agent": "GrayJay-PumpFun/1",
+		},
+		false
+	);
+	this.sock = sk;
+	sk.connect({
+		open: function () {},
+		message: function (msg) {
+			try {
+				handleEngineText(self, String(msg || ""));
+			} catch (e) {
+				log("PumpFun chat parse: " + e);
+			}
+		},
+		closing: function () {},
+		closed: function () {
+			self.sock = null;
+			self.sent40 = false;
+			self.nsReady = false;
+			self.joined = false;
+		},
+		failure: function (m) {
+			self.err = m || "websocket failure";
+			self.sock = null;
+			self.sent40 = false;
+			self.nsReady = false;
+			self.joined = false;
+		},
+	});
+};
+PumpFunChatEngine.prototype.shutdown = function () {
+	try {
+		if (this.sock) this.sock.close();
+	} catch (e) {}
+	this.sock = null;
+	this.sent40 = false;
+	this.nsReady = false;
+	this.joined = false;
+};
+PumpFunChatEngine.prototype.drainLive = function (maxN) {
+	var n = maxN || 80;
+	var out = this.liveOut.splice(0, n);
+	return out;
+};
+PumpFunChatEngine.prototype.drainComments = function (maxN) {
+	var n = maxN || 80;
+	return this.commentOut.splice(0, n);
+};
+
+function getOrCreateChatEngine(roomId, coinUrl) {
+	if (!chatEngines[roomId]) {
+		chatEngines[roomId] = new PumpFunChatEngine(roomId, coinUrl);
+	}
+	return chatEngines[roomId];
+}
+
+function disposeAllChatEngines() {
+	var k = Object.keys(chatEngines);
+	for (var i = 0; i < k.length; i++) {
+		chatEngines[k[i]].shutdown();
+		delete chatEngines[k[i]];
+	}
+}
+
+function PumpFunLiveEventPager(results, hasMore, context) {
+	LiveEventPager.call(this, results, hasMore, context);
+	this.nextRequest = context.nextRequest != null ? context.nextRequest : 1200;
+}
+PumpFunLiveEventPager.prototype = Object.create(LiveEventPager.prototype);
+PumpFunLiveEventPager.prototype.constructor = PumpFunLiveEventPager;
+PumpFunLiveEventPager.prototype.nextPage = function () {
+	var ctx = this.context;
+	var eng = ctx.engine;
+	if (!eng) {
+		return new PumpFunLiveEventPager([], false, ctx);
+	}
+	if (!eng.sock) eng.attachSocket();
+	var batch = eng.drainLive(100);
+	var errLine = eng.err
+		? [
+				new LiveEventComment(
+					"PumpFun",
+					String(eng.err),
+					"",
+					"",
+					[]
+				),
+		  ]
+		: [];
+	eng.err = null;
+	var combined = errLine.concat(batch);
+	return new PumpFunLiveEventPager(combined, true, ctx);
+};
+
+function PumpFunCommentPager(results, hasMore, context) {
+	CommentPager.call(this, results, hasMore, context);
+}
+PumpFunCommentPager.prototype = Object.create(CommentPager.prototype);
+PumpFunCommentPager.prototype.constructor = PumpFunCommentPager;
+PumpFunCommentPager.prototype.nextPage = function () {
+	var ctx = this.context;
+	var eng = ctx.engine;
+	if (!eng) return new PumpFunCommentPager([], false, ctx);
+	if (!eng.sock) eng.attachSocket();
+	var batch = eng.drainComments(100);
+	return new PumpFunCommentPager(batch, true, ctx);
+};
+
 function pluginId() {
 	return config && config.id ? config.id : "";
 }
@@ -34,65 +333,10 @@ function unescapeJsonString(str) {
 		.replace(/\\\\/g, "\\");
 }
 
-function extractJsonObjectAtIsLive(unescapedHtml, posIsLive) {
-	var depth = 0;
-	var i = posIsLive;
-	for (; i >= 0; i--) {
-		var ch = unescapedHtml.charAt(i);
-		if (ch === "}") depth++;
-		else if (ch === "{") {
-			if (depth === 0) {
-				var start = i;
-				depth = 0;
-				for (var k = start; k < unescapedHtml.length; k++) {
-					var c2 = unescapedHtml.charAt(k);
-					if (c2 === "{") depth++;
-					else if (c2 === "}") {
-						depth--;
-						if (depth === 0) {
-							return unescapedHtml.substring(start, k + 1);
-						}
-					}
-				}
-				return null;
-			}
-			depth--;
-		}
-	}
-	return null;
-}
-
-function extractLivestreamsFromHtml(html) {
-	var u = html.replace(/\\"/g, '"');
-	var needle = '"isLive":true';
-	var out = [];
-	var seen = {};
-	var start = 0;
-	while (true) {
-		var idx = u.indexOf(needle, start);
-		if (idx < 0) break;
-		var raw = extractJsonObjectAtIsLive(u, idx);
-		if (raw) {
-			try {
-				var obj = JSON.parse(raw);
-				var mint = obj.mint;
-				if (mint && !seen[mint]) {
-					seen[mint] = true;
-					out.push(obj);
-				}
-			} catch (e) {
-				log("PumpFun: skip live JSON: " + e);
-			}
-		}
-		start = idx + needle.length;
-	}
-	return out;
-}
-
 // Coin pages embed clips.pump.fun playlists (live `_N_live`, adaptive `master_playlist`, or other VOD `.m3u8`).
 function extractHlsUrlsFromCoinHtml(html) {
 	var h = unescapeJsonString(html);
-	var anyRe = /https:\/\/clips\.pump\.fun[^\s"'<>]+\.m3u8/gi;
+	var anyRe = /https?:\/\/clips\.pump\.fun[^\s"'<>]+\.m3u8/gi;
 	var raw = h.match(anyRe) || [];
 	var seen = {};
 	var unique = [];
@@ -156,11 +400,23 @@ function getLiveBundle() {
 	if (liveCache.rows && liveCache.byMint && (now - liveCache.t) < LIVE_CACHE_TTL_MS) {
 		return liveCache;
 	}
-	var html = httpGet(BASE_URL + "/live");
-	var rows = extractLivestreamsFromHtml(html);
+	var raw = httpGetJson(API_URL + "/coins/currently-live");
+	var rows = [];
+	if (Array.isArray(raw)) {
+		var seen = {};
+		for (var i = 0; i < raw.length; i++) {
+			var c = raw[i];
+			if (!c || !c.mint || seen[c.mint]) continue;
+			if (c.is_currently_live === false) continue;
+			seen[c.mint] = true;
+			rows.push(c);
+		}
+	} else {
+		log("PumpFun: /coins/currently-live returned non-array");
+	}
 	var byMint = {};
-	for (var i = 0; i < rows.length; i++) {
-		var r = rows[i];
+	for (var j = 0; j < rows.length; j++) {
+		var r = rows[j];
 		if (r.mint) byMint[r.mint] = r;
 	}
 	liveCache = { t: now, rows: rows, byMint: byMint };
@@ -169,12 +425,15 @@ function getLiveBundle() {
 
 function mapLiveRowToPlatformVideo(row) {
 	var mint = row.mint || "";
-	var title = row.name || row.title || mint;
+	var title =
+		row.livestream_title || row.name || row.title || mint;
 	var symbol = row.symbol || "";
 	var thumb = row.thumbnail || row.image_uri || "";
 	var avatar = row.avatarUri || row.avatar_uri || "";
 	var creator = creatorWalletFromRow(row);
-	var viewers = row.viewerCount != null ? row.viewerCount : 0;
+	var viewers = 0;
+	if (row.viewerCount != null) viewers = row.viewerCount;
+	else if (row.num_participants != null) viewers = row.num_participants;
 	var ts = row.coinCreatedTimestamp != null ? row.coinCreatedTimestamp : row.created_timestamp;
 	var uploadDate = ts ? Math.floor(ts / 1000) : Math.floor(Date.now() / 1000);
 	var authorId = new PlatformID(PLATFORM, creator || mint, pluginId());
@@ -338,7 +597,9 @@ source.enable = function (conf, settings, savedState) {
 	CLIPS_CDN = "https://clips.pump.fun";
 };
 
-source.disable = function () {};
+source.disable = function () {
+	disposeAllChatEngines();
+};
 
 source.getHome = function () {
 	var b = getLiveBundle();
@@ -520,7 +781,8 @@ source.search = function (query, type, order, filters) {
 	var vids = [];
 	for (var i = 0; i < b.rows.length; i++) {
 		var row = b.rows[i];
-		var title = (row.name || row.title || "").toLowerCase();
+		var title = (row.livestream_title || row.name || row.title || "")
+			.toLowerCase();
 		var symbol = (row.symbol || "").toLowerCase();
 		var creator = creatorWalletFromRow(row).toLowerCase();
 		if (
@@ -603,11 +865,87 @@ source.searchChannels = function (query) {
 };
 
 source.getComments = function (url) {
-	throw new ScriptException("PumpFun", "Comments are not supported");
+	var mint = parseMintFromCoinUrl(url);
+	if (!mint) return new CommentPager([], false, null);
+	var coin;
+	try {
+		coin = httpGetJson(API_URL + "/coins/" + encodeURIComponent(mint));
+	} catch (e) {
+		return new CommentPager([], false, null);
+	}
+	if (!coin.is_currently_live) return new CommentPager([], false, null);
+	var cu = BASE_URL + "/coin/" + mint;
+	var eng = getOrCreateChatEngine(mint, cu);
+	eng.attachSocket();
+	return new PumpFunCommentPager([], true, { engine: eng, url: cu });
 };
 
 source.getSubComments = function (comment) {
-	throw new ScriptException("PumpFun", "Sub-comments are not supported");
+	return new CommentPager([], false, null);
+};
+
+source.getLiveEvents = function (url) {
+	var dead = { engine: null, nextRequest: 4000 };
+	var mint = parseMintFromCoinUrl(url);
+	if (!mint) return new PumpFunLiveEventPager([], false, dead);
+	var coin;
+	try {
+		coin = httpGetJson(API_URL + "/coins/" + encodeURIComponent(mint));
+	} catch (e) {
+		return new PumpFunLiveEventPager([], false, dead);
+	}
+	if (!coin.is_currently_live) {
+		return new PumpFunLiveEventPager([], false, dead);
+	}
+	var cu = BASE_URL + "/coin/" + mint;
+	var eng = getOrCreateChatEngine(mint, cu);
+	eng.attachSocket();
+	return new PumpFunLiveEventPager([], true, {
+		engine: eng,
+		nextRequest: 1200,
+	});
+};
+
+// WebView chat: GrayJay when "Live chat window" / embedded chat is enabled (no extra auth).
+source.getLiveChatWindow = function (url) {
+	var mint = parseMintFromCoinUrl(url);
+	if (!mint) return null;
+	return {
+		url: BASE_URL + "/coin/" + mint,
+		removeElements: [],
+		removeElementsInterval: [],
+	};
+};
+
+// "Related" shelf: other coins from the same creator (public …/coins?creator=…); excludes current mint.
+source.getContentRecommendations = function (url) {
+	var mint = parseMintFromCoinUrl(url);
+	if (!mint) return new ContentPager([], false, null);
+	var coin;
+	try {
+		coin = httpGetJson(API_URL + "/coins/" + encodeURIComponent(mint));
+	} catch (e) {
+		return new ContentPager([], false, null);
+	}
+	var creator = coin.creator || "";
+	if (!creator) return new ContentPager([], false, null);
+	var user = httpGetJson(API_URL + "/users/" + encodeURIComponent(creator));
+	var b = getLiveBundle();
+	var raw = httpGetJson(
+		API_URL +
+			"/coins?creator=" +
+			encodeURIComponent(creator) +
+			"&limit=24&offset=0"
+	);
+	if (!Array.isArray(raw)) return new ContentPager([], false, null);
+	var items = [];
+	for (var i = 0; i < raw.length; i++) {
+		var c = raw[i];
+		if (!c || !c.mint || c.mint === mint) continue;
+		items.push(mapCreatorCoinToVideo(c, user, b.byMint[c.mint]));
+		if (items.length >= 12) break;
+	}
+	return new ContentPager(items, false, null);
 };
 
 // Official Example Plugin.md still uses these names; many GrayJay builds call them instead of
