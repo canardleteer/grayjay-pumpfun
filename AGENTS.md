@@ -16,9 +16,10 @@ and the docs it links from there.
   `GET https://pump.fun/coin/<mint>` HTML to resolve **HLS** URLs
   (`clips.pump.fun`, `master_playlist_*.m3u8`, fallbacks `*_N_live.m3u8`).
 - **Channels:** `https://pump.fun/profile/<wallet>` → user API
-  `.../users/<address>`; channel feed uses `.../coins?creator=<address>`
-  filtered by **`is_currently_live`**, enriched from cached `/live` rows when
-  mints match.
+  `.../users/<address>`; **`getChannelVideos`** lists **all** coins from
+  `.../coins?creator=<address>&limit=50&offset=…` (paginated `VideoPager`), sorted
+  **live first** then by `created_timestamp`, enriched from cached `/live` when
+  the mint is live. **`getUserSubscriptions`** returns `[]` (no pump.fun auth).
 
 ## Where to edit
 
@@ -40,7 +41,11 @@ and the docs it links from there.
    **`extractLivestreamsFromHtml`** (and keep dedupe by `mint`). Re-test using
    saved HTML samples and GrayJay’s plugin **Testing** tab where possible.
 2. **Coin page HLS** — If playlist URLs move hosts or filename patterns change,
-   update **`extractHlsUrlsFromCoinHtml`** regexes and fallbacks.
+   update **`extractHlsUrlsFromCoinHtml`** (live `_N_live`, `master_playlist`, and
+   any other `clips.pump.fun` `.m3u8` treated as a recorded fallback) and
+   **`pickLiveHlsPlaylist` / `pickRecordedHlsPlaylist`**. Offline details use
+   **`VideoSourceDescriptor([HLSSource])`**; live uses **`live: HLSSource`** as
+   before.
 3. **`frontend-api-v3`** — Field renames (`creator`, `image_uri`,
    `is_currently_live`, timestamps) or path changes require updates in mapping
    helpers and URLs. Prefer **`encodeURIComponent`** on path segments for mints
@@ -73,10 +78,12 @@ follow the **Content types** (and related) documentation linked from that guide.
 
 ## Product scope (do not “fix” as bugs)
 
-- Search / channel search only see **currently live** creators and tokens (no
-  global user index in this plugin).
-- No VODs, no comments/chat unless you add WebSocket support and GrayJay support
-  for it.
+- **Search / searchChannels** only see **currently live** creators from `/live`
+  (no global user index).
+- **Recorded clips** only appear when URLs exist in **public coin HTML**; there
+  is no dependency on a separate clips API unless you add one that is public
+  and stable.
+- **Comments/chat** are not implemented (no WebSocket in this plugin).
 
 When extending scope, prefer explicit product decisions over silently widening
 what the plugin claims to support.

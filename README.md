@@ -35,10 +35,17 @@ Deployment** in
 
 ![QR code to add this source in GrayJay](images/qrcode.png)
 
+## Subscriptions and channel feeds
+
+You can **subscribe** to a creator in GrayJay using their **`https://pump.fun/profile/<wallet>`** URL. The channel feed lists **all** of that wallet’s coins from the public API (live first, then newest by creation time), with **pagination** (`limit` / `offset`), so the feed stays useful even when nothing is live.
+
+## Recorded / historical video
+
+If pump.fun leaves **non-live** HLS manifests on a coin page (e.g. `master_playlist` or other `.m3u8` under `clips.pump.fun` that are not `_live` playlists), the plugin will try to play them as **recorded** streams. There is **no** separate public `clips-api` host in use (it did not resolve in testing); anything beyond what appears in **coin HTML** may not be available.
+
 ## Limitations
 
-Search and channel discovery only cover **currently live** streams from `/live`.
-No VODs, no live chat in this plugin.
+**Search** and **search channels** still only reflect **currently live** rows from `/live` (no global pump.fun user index). **Live chat** is not implemented. **`getUserSubscriptions`** returns an empty list — pump.fun login is not part of this plugin; subscriptions are whatever channel URLs GrayJay stores when you add or subscribe to a profile.
 
 ## Links
 

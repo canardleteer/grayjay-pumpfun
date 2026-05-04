@@ -89,29 +89,56 @@ function extractLivestreamsFromHtml(html) {
 	return out;
 }
 
-// Coin pages embed absolute clips.pump.fun URLs (often escaped in Next.js payloads).
+// Coin pages embed clips.pump.fun playlists (live `_N_live`, adaptive `master_playlist`, or other VOD `.m3u8`).
 function extractHlsUrlsFromCoinHtml(html) {
 	var h = unescapeJsonString(html);
-	var masterRe = /https:\/\/clips\.pump\.fun[^\s"'<>]+master_playlist[^\s"'<>]*\.m3u8/g;
-	var liveRe = /https:\/\/clips\.pump\.fun[^\s"'<>]+playlist_[^\s"'<>]+_[0-2]_live\.m3u8/g;
-	var masters = h.match(masterRe) || [];
-	var lives = h.match(liveRe) || [];
+	var anyRe = /https:\/\/clips\.pump\.fun[^\s"'<>]+\.m3u8/gi;
+	var raw = h.match(anyRe) || [];
+	var seen = {};
+	var unique = [];
+	for (var i = 0; i < raw.length; i++) {
+		var u = raw[i];
+		if (!seen[u]) {
+			seen[u] = true;
+			unique.push(u);
+		}
+	}
+	var master = null;
+	var vod = null;
 	var byQ = { 0: null, 1: null, 2: null };
-	for (var i = 0; i < lives.length; i++) {
-		var u = lives[i];
-		var m = u.match(/_([0-2])_live\.m3u8$/);
-		if (m) byQ[parseInt(m[1], 10)] = u;
+	for (var j = 0; j < unique.length; j++) {
+		var url = unique[j];
+		if (/master_playlist/i.test(url)) {
+			if (!master) master = url;
+			continue;
+		}
+		var lm = url.match(/_([0-2])_live\.m3u8$/i);
+		if (lm) {
+			byQ[parseInt(lm[1], 10)] = url;
+			continue;
+		}
+		if (!vod) vod = url;
 	}
 	return {
-		master: masters.length ? masters[0] : null,
+		master: master,
+		vod: vod,
 		low: byQ[0],
 		medium: byQ[1],
 		high: byQ[2],
 	};
 }
 
-function pickHlsPlaylist(ex) {
+function pickLiveHlsPlaylist(ex) {
 	if (ex.master) return ex.master;
+	if (ex.high) return ex.high;
+	if (ex.medium) return ex.medium;
+	if (ex.low) return ex.low;
+	return null;
+}
+
+function pickRecordedHlsPlaylist(ex) {
+	if (ex.master) return ex.master;
+	if (ex.vod) return ex.vod;
 	if (ex.high) return ex.high;
 	if (ex.medium) return ex.medium;
 	if (ex.low) return ex.low;
@@ -170,7 +197,7 @@ function mapLiveRowToPlatformVideo(row) {
 	});
 }
 
-function mapCoinAndUserToPlatformVideo(coin, user) {
+function mapLiveCoinFallbackVideo(coin, user) {
 	var mint = coin.mint || "";
 	var creator = coin.creator || "";
 	var title = coin.name || mint;
@@ -201,6 +228,54 @@ function mapCoinAndUserToPlatformVideo(coin, user) {
 	});
 }
 
+function mapCoinToOfflineVideo(coin, user) {
+	var mint = coin.mint || "";
+	var creator = coin.creator || "";
+	var title = coin.name || mint;
+	var symbol = coin.symbol || "";
+	var thumb = coin.image_uri || "";
+	var avatar = user && user.profile_image ? user.profile_image : "";
+	var uname = user && user.username ? user.username : symbol;
+	var uploadDate = coin.created_timestamp
+		? Math.floor(coin.created_timestamp / 1000)
+		: Math.floor(Date.now() / 1000);
+	var authorId = new PlatformID(PLATFORM, creator || mint, pluginId());
+	return new PlatformVideo({
+		id: new PlatformID(PLATFORM, mint, pluginId()),
+		name: title,
+		thumbnails: new Thumbnails([new Thumbnail(thumb || "", 0)]),
+		author: new PlatformAuthorLink(
+			authorId,
+			uname || symbol,
+			BASE_URL + "/profile/" + creator,
+			avatar || "",
+			user && user.followers != null ? user.followers : null
+		),
+		uploadDate: uploadDate,
+		url: BASE_URL + "/coin/" + mint,
+		duration: 0,
+		viewCount: 0,
+		isLive: false,
+	});
+}
+
+function mapCreatorCoinToVideo(coin, user, liveRow) {
+	if (coin.is_currently_live && liveRow) {
+		return mapLiveRowToPlatformVideo(liveRow);
+	}
+	if (coin.is_currently_live) {
+		return mapLiveCoinFallbackVideo(coin, user);
+	}
+	return mapCoinToOfflineVideo(coin, user);
+}
+
+function compareChannelVideosOrder(a, b) {
+	if (a.isLive !== b.isLive) {
+		return a.isLive ? -1 : 1;
+	}
+	return (b.uploadDate || 0) - (a.uploadDate || 0);
+}
+
 function parseMintFromCoinUrl(url) {
 	var m = String(url || "").match(/pump\.fun\/coin\/([^\/\?#]+)/i);
 	return m ? m[1] : null;
@@ -210,6 +285,51 @@ function parseWalletFromProfileUrl(url) {
 	var m = String(url || "").match(/pump\.fun\/profile\/([^\/\?#]+)/i);
 	return m ? m[1] : null;
 }
+
+function fetchCreatorCoinsPage(wallet, offset, limit) {
+	var lim = limit || 50;
+	var off = offset || 0;
+	var u =
+		API_URL +
+		"/coins?creator=" +
+		encodeURIComponent(wallet) +
+		"&limit=" +
+		lim +
+		"&offset=" +
+		off;
+	return httpGetJson(u);
+}
+
+function PumpFunChannelCoinsPager(context) {
+	var wallet = context.wallet;
+	var pageSize = context.pageSize || 50;
+	var offset = context.offset || 0;
+	var coins = fetchCreatorCoinsPage(wallet, offset, pageSize);
+	var b = getLiveBundle();
+	var user = httpGetJson(API_URL + "/users/" + encodeURIComponent(wallet));
+	var vids = [];
+	for (var i = 0; i < coins.length; i++) {
+		var c = coins[i];
+		vids.push(mapCreatorCoinToVideo(c, user, b.byMint[c.mint]));
+	}
+	vids.sort(compareChannelVideosOrder);
+	var hasMore = coins.length >= pageSize;
+	VideoPager.call(this, vids, hasMore, {
+		wallet: wallet,
+		offset: offset,
+		pageSize: pageSize,
+	});
+}
+PumpFunChannelCoinsPager.prototype = Object.create(VideoPager.prototype);
+PumpFunChannelCoinsPager.prototype.constructor = PumpFunChannelCoinsPager;
+PumpFunChannelCoinsPager.prototype.nextPage = function () {
+	var ctx = this.context;
+	return new PumpFunChannelCoinsPager({
+		wallet: ctx.wallet,
+		offset: (ctx.offset || 0) + (ctx.pageSize || 50),
+		pageSize: ctx.pageSize || 50,
+	});
+};
 
 source.enable = function (conf, settings, savedState) {
 	config = conf ?? {};
@@ -239,10 +359,6 @@ source.getVideoDetails = function (url) {
 	var coin = httpGetJson(API_URL + "/coins/" + encodeURIComponent(mint));
 	var coinHtml = httpGet(BASE_URL + "/coin/" + mint);
 	var hls = extractHlsUrlsFromCoinHtml(coinHtml);
-	var playlist = pickHlsPlaylist(hls);
-	if (!playlist) {
-		throw new ScriptException("PumpFun", "No live HLS playlist for this coin");
-	}
 	var creator = coin.creator || "";
 	var user = creator
 		? httpGetJson(API_URL + "/users/" + encodeURIComponent(creator))
@@ -257,18 +373,74 @@ source.getVideoDetails = function (url) {
 		? Math.floor(coin.created_timestamp / 1000)
 		: Math.floor(Date.now() / 1000);
 	var authorId = new PlatformID(PLATFORM, creator || mint, pluginId());
+	var isLive = !!coin.is_currently_live;
+	var playlist = isLive
+		? pickLiveHlsPlaylist(hls)
+		: pickRecordedHlsPlaylist(hls);
+	var mod = {
+		headers: {
+			Referer: BASE_URL + "/",
+			Origin: BASE_URL,
+		},
+	};
+	if (!playlist) {
+		var noPlay =
+			desc +
+			(isLive
+				? "\n\nNo live HLS playlist was found for this coin."
+				: "\n\nNo recorded stream URL was found on this coin page (clips are only available when pump.fun exposes them in public HTML).");
+		return new PlatformVideoDetails({
+			id: new PlatformID(PLATFORM, mint, pluginId()),
+			name: title,
+			thumbnails: new Thumbnails([new Thumbnail(thumb || "", 0)]),
+			author: new PlatformAuthorLink(
+				authorId,
+				uname || symbol,
+				BASE_URL + "/coin/" + mint,
+				avatar || "",
+				user.followers != null ? user.followers : null
+			),
+			uploadDate: uploadDate,
+			url: BASE_URL + "/coin/" + mint,
+			duration: isLive ? -1 : 0,
+			viewCount: 0,
+			isLive: isLive,
+			description: noPlay.trim(),
+			video: new VideoSourceDescriptor([]),
+			live: null,
+			subtitles: [],
+		});
+	}
 	var hlsSource = new HLSSource({
-		name: "Live",
+		name: isLive ? "Live" : "Recorded",
 		duration: -1,
 		url: playlist,
 		priority: true,
-		requestModifier: {
-			headers: {
-				Referer: BASE_URL + "/",
-				Origin: BASE_URL,
-			},
-		},
+		requestModifier: mod,
 	});
+	if (isLive) {
+		return new PlatformVideoDetails({
+			id: new PlatformID(PLATFORM, mint, pluginId()),
+			name: title,
+			thumbnails: new Thumbnails([new Thumbnail(thumb || "", 0)]),
+			author: new PlatformAuthorLink(
+				authorId,
+				uname || symbol,
+				BASE_URL + "/coin/" + mint,
+				avatar || "",
+				user.followers != null ? user.followers : null
+			),
+			uploadDate: uploadDate,
+			url: BASE_URL + "/coin/" + mint,
+			duration: -1,
+			viewCount: 0,
+			isLive: true,
+			description: desc,
+			video: new VideoSourceDescriptor([]),
+			live: hlsSource,
+			subtitles: [],
+		});
+	}
 	return new PlatformVideoDetails({
 		id: new PlatformID(PLATFORM, mint, pluginId()),
 		name: title,
@@ -284,10 +456,10 @@ source.getVideoDetails = function (url) {
 		url: BASE_URL + "/coin/" + mint,
 		duration: -1,
 		viewCount: 0,
-		isLive: true,
+		isLive: false,
 		description: desc,
-		video: new VideoSourceDescriptor([]),
-		live: hlsSource,
+		video: new VideoSourceDescriptor([hlsSource]),
+		live: null,
 		subtitles: [],
 	});
 };
@@ -315,21 +487,15 @@ source.getChannel = function (url) {
 source.getChannelVideos = function (url, type, order, filters) {
 	var w = parseWalletFromProfileUrl(url);
 	if (!w) return new VideoPager([], false, null);
-	var b = getLiveBundle();
-	var coins = httpGetJson(API_URL + "/coins?creator=" + encodeURIComponent(w));
-	var user = httpGetJson(API_URL + "/users/" + encodeURIComponent(w));
-	var vids = [];
-	for (var i = 0; i < coins.length; i++) {
-		var c = coins[i];
-		if (!c.is_currently_live) continue;
-		var row = b.byMint[c.mint];
-		if (row) {
-			vids.push(mapLiveRowToPlatformVideo(row));
-		} else {
-			vids.push(mapCoinAndUserToPlatformVideo(c, user));
-		}
-	}
-	return new VideoPager(vids, false, null);
+	return new PumpFunChannelCoinsPager({
+		wallet: w,
+		offset: 0,
+		pageSize: 50,
+	});
+};
+
+source.getUserSubscriptions = function () {
+	return [];
 };
 
 source.getChannelCapabilities = function () {
