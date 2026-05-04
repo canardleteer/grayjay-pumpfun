@@ -4,10 +4,10 @@
 	"author": "canardleteer",
 	"authorUrl": "https://github.com/canardleteer/grayjay-pumpfun",
 
-	"sourceUrl": "https://github.com/canardleteer/grayjay-pumpfun",
+	"sourceUrl": "https://raw.githubusercontent.com/canardleteer/grayjay-pumpfun/main/PumpFunConfig.json",
 	"repositoryUrl": "https://github.com/canardleteer/grayjay-pumpfun",
-	"scriptUrl": "./PumpFunScript.js",
-	"iconUrl": "./images/pumpfun-icon.png",
+	"scriptUrl": "https://raw.githubusercontent.com/canardleteer/grayjay-pumpfun/main/PumpFunScript.js",
+	"iconUrl": "https://raw.githubusercontent.com/canardleteer/grayjay-pumpfun/main/images/pumpfun-icon.png",
 	"version": 1,
 
 	"id": "c4a8f2b1-9d3e-4f71-8c2a-1e9b7f6d5a30",

@@ -16,14 +16,14 @@ source that reads their public pages and APIs only.
 2. Open **Sources** (or your app’s equivalent) and **add a new source**.
 3. Paste the **HTTPS URL to the published `PumpFunConfig.json`**, or scan a **QR
    code** from the maintainer that points at that same URL. GrayJay fetches the
-   manifest, then loads `PumpFunScript.js` from the path in `scriptUrl` (next to
-   the config on the host).
+   manifest, then loads the script and icon from the URLs in `scriptUrl` and
+   `iconUrl`.
 
-This project’s manifest names **`https://github.com/canardleteer/grayjay-pumpfun`**
-as `sourceUrl` and `repositoryUrl` in [`PumpFunConfig.json`](PumpFunConfig.json).
-You need the **actual file URL** that returns JSON (for example a
-`raw.githubusercontent.com/.../PumpFunConfig.json` link on your default branch,
-or GitHub Pages)—whatever URL the publisher advertises alongside that repo.
+For installs from **raw.githubusercontent.com**, this repo uses **absolute**
+`scriptUrl` / `iconUrl` / `sourceUrl` in [`PumpFunConfig.json`](PumpFunConfig.json)
+so GrayJay does not depend on resolving `./`-relative paths against the config
+URL (which can trigger a **“script not available” / 404** on some builds).
+`repositoryUrl` remains the GitHub repo page for humans.
 
 How distribution and QR codes work in GrayJay is described under **Plugin
 Deployment** in
