@@ -1,5 +1,7 @@
 # grayjay-pumpfun
 
+**WARNING: EXPERIMENTAL**
+
 GrayJay source plugin for **live** token streams on
 **[pump.fun](https://pump.fun)** (live directory data comes from the public
 **`frontend-api-v3`** **`/coins/currently-live`** JSON, not from the

@@ -66,9 +66,12 @@ simplify or harden the plumbing.
 2. **Coin page HLS** — If playlist URLs move hosts or filename patterns change,
    update **`extractHlsUrlsFromCoinHtml`** (live `_N_live`, `master_playlist`, and
    any other `clips.pump.fun` `.m3u8` treated as a recorded fallback) and
-   **`pickLiveHlsPlaylist` / `pickRecordedHlsPlaylist`**. Offline details use
-   **`VideoSourceDescriptor([HLSSource])`**; live uses **`live: HLSSource`** as
-   before.
+   **`pickLiveHlsPlaylist` / `pickRecordedHlsPlaylist`**. On **GrayJay
+   Desktop**, **`SourceAuto`** may use **`VideoSourceDescriptor`** and/or
+   **`PlatformVideoDetails.Live`**. The **YouTube** plugin sets **`hls`**,
+   **`live`**, and **`video: VideoSourceDescriptor([HLSSource])`** together for
+   live HLS. This script mirrors that for all pump.fun HLS; **`isLive`** still
+   reflects the API for UI/chat.
 3. **`frontend-api-v3`** — Field renames (`creator`, `image_uri`,
    `is_currently_live`, timestamps) or path changes require updates in mapping
    helpers and URLs. Prefer **`encodeURIComponent`** on path segments for mints
@@ -87,6 +90,12 @@ still invoke the legacy names; without aliases, the app can show **“No source
 enabled to support this video”** for pump.fun URLs. Align any new `source.*`
 methods with the **Source** interface described in GrayJay’s docs from
 [plugin-development.md](https://gitlab.futo.org/videostreaming/grayjay/-/blob/master/plugin-development.md).
+On **GrayJay Desktop**, built-in pagers such as **`LiveEventPager`**,
+**`CommentPager`**, and **`VideoPager`** are **ES6 classes**: do **not**
+subclass them with `Parent.call(this, …)` or `Object.create(Parent.prototype)`
+— use **`new Parent(…)`** and assign **`nextPage`** on the instance (see
+**`makePumpFunLiveEventPager`** / **`makePumpFunCommentPager`** /
+**`makePumpFunChannelCoinsPager`** in the script).
 
 Use the **`http`** package (**`http.GET`**, **`http.batch()`**) as described
 there. For **`PlatformVideoDetails`**, live HLS, and `VideoSourceDescriptor`,

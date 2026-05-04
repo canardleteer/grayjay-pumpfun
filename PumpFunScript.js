@@ -263,17 +263,17 @@ function disposeAllChatEngines() {
 	}
 }
 
-function PumpFunLiveEventPager(results, hasMore, context) {
-	LiveEventPager.call(this, results, hasMore, context);
-	this.nextRequest = context.nextRequest != null ? context.nextRequest : 1200;
-}
-PumpFunLiveEventPager.prototype = Object.create(LiveEventPager.prototype);
-PumpFunLiveEventPager.prototype.constructor = PumpFunLiveEventPager;
-PumpFunLiveEventPager.prototype.nextPage = function () {
+// GrayJay Desktop exposes LiveEventPager / CommentPager as ES6 classes — subclassing via
+// Parent.call(this) throws. Build instances with `new` and replace `nextPage` on each pager.
+function pumpFunLiveEventNextPage() {
 	var ctx = this.context;
 	var eng = ctx.engine;
 	if (!eng) {
-		return new PumpFunLiveEventPager([], false, ctx);
+		var deadPager = new LiveEventPager([], false, ctx);
+		deadPager.nextRequest =
+			ctx && ctx.nextRequest != null ? ctx.nextRequest : 4000;
+		deadPager.nextPage = pumpFunLiveEventNextPage;
+		return deadPager;
 	}
 	if (!eng.sock) eng.attachSocket();
 	var batch = eng.drainLive(100);
@@ -290,22 +290,41 @@ PumpFunLiveEventPager.prototype.nextPage = function () {
 		: [];
 	eng.err = null;
 	var combined = errLine.concat(batch);
-	return new PumpFunLiveEventPager(combined, true, ctx);
-};
-
-function PumpFunCommentPager(results, hasMore, context) {
-	CommentPager.call(this, results, hasMore, context);
+	var nextPager = new LiveEventPager(combined, true, ctx);
+	nextPager.nextRequest =
+		ctx && ctx.nextRequest != null ? ctx.nextRequest : 1200;
+	nextPager.nextPage = pumpFunLiveEventNextPage;
+	return nextPager;
 }
-PumpFunCommentPager.prototype = Object.create(CommentPager.prototype);
-PumpFunCommentPager.prototype.constructor = PumpFunCommentPager;
-PumpFunCommentPager.prototype.nextPage = function () {
+
+function makePumpFunLiveEventPager(results, hasMore, context) {
+	var pager = new LiveEventPager(results, hasMore, context);
+	pager.nextRequest =
+		context && context.nextRequest != null ? context.nextRequest : 1200;
+	pager.nextPage = pumpFunLiveEventNextPage;
+	return pager;
+}
+
+function pumpFunCommentNextPage() {
 	var ctx = this.context;
 	var eng = ctx.engine;
-	if (!eng) return new PumpFunCommentPager([], false, ctx);
+	if (!eng) {
+		var empty = new CommentPager([], false, ctx);
+		empty.nextPage = pumpFunCommentNextPage;
+		return empty;
+	}
 	if (!eng.sock) eng.attachSocket();
 	var batch = eng.drainComments(100);
-	return new PumpFunCommentPager(batch, true, ctx);
-};
+	var nextPager = new CommentPager(batch, true, ctx);
+	nextPager.nextPage = pumpFunCommentNextPage;
+	return nextPager;
+}
+
+function makePumpFunCommentPager(results, hasMore, context) {
+	var pager = new CommentPager(results, hasMore, context);
+	pager.nextPage = pumpFunCommentNextPage;
+	return pager;
+}
 
 function pluginId() {
 	return config && config.id ? config.id : "";
@@ -320,7 +339,31 @@ function httpGet(url) {
 }
 
 function httpGetJson(url) {
-	return JSON.parse(httpGet(url));
+	var body = httpGet(url);
+	var s = body == null ? "" : String(body).trim();
+	if (!s) {
+		throw new ScriptException(
+			"PumpFun",
+			"Empty response (expected JSON): " + url
+		);
+	}
+	return JSON.parse(s);
+}
+
+// GET /users/{wallet}: frontend-api-v3 often returns HTTP 200 with an empty body
+// (no public profile JSON). Never throw; use {} and fall back to coin/symbol data.
+function httpGetUserJson(wallet) {
+	if (!wallet) return {};
+	var url = API_URL + "/users/" + encodeURIComponent(wallet);
+	var resp = http.GET(url, { "User-Agent": "GrayJay-PumpFun/1" }, false);
+	if (!resp || !resp.isOk) return {};
+	var s = resp.body == null ? "" : String(resp.body).trim();
+	if (!s) return {};
+	try {
+		return JSON.parse(s);
+	} catch (e) {
+		return {};
+	}
 }
 
 function unescapeJsonString(str) {
@@ -380,19 +423,104 @@ function pickLiveHlsPlaylist(ex) {
 	return null;
 }
 
+// VOD / replay: only adaptive master or non-`_N_live` playlists. Never use
+// `ex.high`/`medium`/`low` — those are `_0_live`… URLs that go dead when the
+// stream ends; GrayJay then errors ("missing stream") while `master_playlist`
+// or another `.m3u8` may still work.
 function pickRecordedHlsPlaylist(ex) {
 	if (ex.master) return ex.master;
 	if (ex.vod) return ex.vod;
-	if (ex.high) return ex.high;
-	if (ex.medium) return ex.medium;
-	if (ex.low) return ex.low;
 	return null;
 }
 
+// Coin/detail APIs may return `creator` as a wallet string or `{ address }`.
+function creatorWalletFromField(creatorField) {
+	if (creatorField == null || creatorField === "") return "";
+	if (typeof creatorField === "string") return creatorField;
+	if (typeof creatorField === "object") return creatorField.address || "";
+	return "";
+}
+
 function creatorWalletFromRow(row) {
-	if (!row || !row.creator) return "";
-	if (typeof row.creator === "string") return row.creator;
-	return row.creator.address || "";
+	if (!row) return "";
+	return creatorWalletFromField(row.creator);
+}
+
+// Author/channel link for GrayJay: must be a profile URL, not a coin URL, or
+// Desktop opens "channel" for …/coin/… and no plugin matches (null client / errors).
+function pumpFunAuthorProfileUrl(creatorWallet) {
+	var c = creatorWallet ? String(creatorWallet).trim() : "";
+	if (c) return BASE_URL + "/profile/" + c;
+	return BASE_URL;
+}
+
+function pumpFunShortWalletDisplay(wallet) {
+	var w = (wallet || "").trim();
+	if (!w) return "pump.fun";
+	if (w.length <= 14) return w;
+	return w.substring(0, 4) + "…" + w.substring(w.length - 4);
+}
+
+function pumpFunCoinsJsonForCreator(wallet, limit, offset) {
+	try {
+		var lim = limit || 12;
+		var off = offset || 0;
+		var raw = httpGetJson(
+			API_URL +
+				"/coins?creator=" +
+				encodeURIComponent(wallet) +
+				"&limit=" +
+				lim +
+				"&offset=" +
+				off
+		);
+		return Array.isArray(raw) ? raw : [];
+	} catch (e) {
+		return [];
+	}
+}
+
+function pumpFunDisplayNameFromCoins(coins) {
+	if (!coins || !coins.length) return null;
+	for (var i = 0; i < coins.length; i++) {
+		var c = coins[i];
+		if (!c) continue;
+		var sym = (c.symbol && String(c.symbol).trim()) || "";
+		if (sym) return sym;
+	}
+	var c0 = coins[0];
+	var nm = (c0.name && String(c0.name).trim()) || "";
+	if (nm) {
+		if (nm.length > 48) return nm.substring(0, 45) + "…";
+		return nm;
+	}
+	return null;
+}
+
+// Full wallet + profile URL for About / description (GrayJay header is usually a single `name`).
+function pumpFunChannelWalletDescription(wallet, bio) {
+	var w = (wallet || "").trim();
+	var profileUrl = BASE_URL + "/profile/" + w;
+	var lines = ["Wallet: " + w, profileUrl];
+	var b = (bio && String(bio).trim()) || "";
+	if (b) {
+		lines.push("");
+		lines.push(b);
+	}
+	return lines.join("\n");
+}
+
+function pumpFunChannelHeaderLabels(wallet, user) {
+	var w = (wallet || "").trim();
+	var u = user || {};
+	var username = (u.username && String(u.username).trim()) || "";
+	var coins = pumpFunCoinsJsonForCreator(w, 12, 0);
+	var fromCoins = pumpFunDisplayNameFromCoins(coins);
+	var name = username || fromCoins || pumpFunShortWalletDisplay(w);
+	return {
+		name: name,
+		description: pumpFunChannelWalletDescription(w, u.bio || ""),
+	};
 }
 
 function getLiveBundle() {
@@ -444,7 +572,7 @@ function mapLiveRowToPlatformVideo(row) {
 		author: new PlatformAuthorLink(
 			authorId,
 			symbol || title,
-			BASE_URL + "/coin/" + mint,
+			pumpFunAuthorProfileUrl(creator),
 			avatar || "",
 			null
 		),
@@ -458,7 +586,7 @@ function mapLiveRowToPlatformVideo(row) {
 
 function mapLiveCoinFallbackVideo(coin, user) {
 	var mint = coin.mint || "";
-	var creator = coin.creator || "";
+	var creator = creatorWalletFromField(coin.creator);
 	var title = coin.name || mint;
 	var symbol = coin.symbol || "";
 	var thumb = coin.image_uri || "";
@@ -475,7 +603,7 @@ function mapLiveCoinFallbackVideo(coin, user) {
 		author: new PlatformAuthorLink(
 			authorId,
 			uname || symbol,
-			BASE_URL + "/profile/" + creator,
+			pumpFunAuthorProfileUrl(creator),
 			avatar || "",
 			user && user.followers != null ? user.followers : null
 		),
@@ -489,7 +617,7 @@ function mapLiveCoinFallbackVideo(coin, user) {
 
 function mapCoinToOfflineVideo(coin, user) {
 	var mint = coin.mint || "";
-	var creator = coin.creator || "";
+	var creator = creatorWalletFromField(coin.creator);
 	var title = coin.name || mint;
 	var symbol = coin.symbol || "";
 	var thumb = coin.image_uri || "";
@@ -506,7 +634,7 @@ function mapCoinToOfflineVideo(coin, user) {
 		author: new PlatformAuthorLink(
 			authorId,
 			uname || symbol,
-			BASE_URL + "/profile/" + creator,
+			pumpFunAuthorProfileUrl(creator),
 			avatar || "",
 			user && user.followers != null ? user.followers : null
 		),
@@ -556,16 +684,31 @@ function fetchCreatorCoinsPage(wallet, offset, limit) {
 		lim +
 		"&offset=" +
 		off;
-	return httpGetJson(u);
+	var raw = httpGetJson(u);
+	return Array.isArray(raw) ? raw : [];
 }
 
-function PumpFunChannelCoinsPager(context) {
+function pumpFunChannelCoinsNextPage() {
+	var ctx = this.context;
+	if (!ctx || !ctx.wallet) {
+		var empty = new VideoPager([], false, null);
+		empty.nextPage = pumpFunChannelCoinsNextPage;
+		return empty;
+	}
+	return makePumpFunChannelCoinsPager({
+		wallet: ctx.wallet,
+		offset: (ctx.offset || 0) + (ctx.pageSize || 50),
+		pageSize: ctx.pageSize || 50,
+	});
+}
+
+function makePumpFunChannelCoinsPager(context) {
 	var wallet = context.wallet;
 	var pageSize = context.pageSize || 50;
 	var offset = context.offset || 0;
 	var coins = fetchCreatorCoinsPage(wallet, offset, pageSize);
 	var b = getLiveBundle();
-	var user = httpGetJson(API_URL + "/users/" + encodeURIComponent(wallet));
+	var user = httpGetUserJson(wallet);
 	var vids = [];
 	for (var i = 0; i < coins.length; i++) {
 		var c = coins[i];
@@ -573,22 +716,14 @@ function PumpFunChannelCoinsPager(context) {
 	}
 	vids.sort(compareChannelVideosOrder);
 	var hasMore = coins.length >= pageSize;
-	VideoPager.call(this, vids, hasMore, {
+	var pager = new VideoPager(vids, hasMore, {
 		wallet: wallet,
 		offset: offset,
 		pageSize: pageSize,
 	});
+	pager.nextPage = pumpFunChannelCoinsNextPage;
+	return pager;
 }
-PumpFunChannelCoinsPager.prototype = Object.create(VideoPager.prototype);
-PumpFunChannelCoinsPager.prototype.constructor = PumpFunChannelCoinsPager;
-PumpFunChannelCoinsPager.prototype.nextPage = function () {
-	var ctx = this.context;
-	return new PumpFunChannelCoinsPager({
-		wallet: ctx.wallet,
-		offset: (ctx.offset || 0) + (ctx.pageSize || 50),
-		pageSize: ctx.pageSize || 50,
-	});
-};
 
 source.enable = function (conf, settings, savedState) {
 	config = conf ?? {};
@@ -620,10 +755,8 @@ source.getVideoDetails = function (url) {
 	var coin = httpGetJson(API_URL + "/coins/" + encodeURIComponent(mint));
 	var coinHtml = httpGet(BASE_URL + "/coin/" + mint);
 	var hls = extractHlsUrlsFromCoinHtml(coinHtml);
-	var creator = coin.creator || "";
-	var user = creator
-		? httpGetJson(API_URL + "/users/" + encodeURIComponent(creator))
-		: {};
+	var creator = creatorWalletFromField(coin.creator);
+	var user = httpGetUserJson(creator);
 	var title = coin.name || mint;
 	var symbol = coin.symbol || "";
 	var thumb = coin.image_uri || "";
@@ -634,10 +767,18 @@ source.getVideoDetails = function (url) {
 		? Math.floor(coin.created_timestamp / 1000)
 		: Math.floor(Date.now() / 1000);
 	var authorId = new PlatformID(PLATFORM, creator || mint, pluginId());
-	var isLive = !!coin.is_currently_live;
-	var playlist = isLive
-		? pickLiveHlsPlaylist(hls)
-		: pickRecordedHlsPlaylist(hls);
+	var apiLive = !!coin.is_currently_live;
+	var livePl = pickLiveHlsPlaylist(hls);
+	var recPl = pickRecordedHlsPlaylist(hls);
+	var isLive = false;
+	var playlist = null;
+	if (apiLive && livePl) {
+		isLive = true;
+		playlist = livePl;
+	} else {
+		isLive = false;
+		playlist = recPl || livePl;
+	}
 	var mod = {
 		headers: {
 			Referer: BASE_URL + "/",
@@ -657,7 +798,7 @@ source.getVideoDetails = function (url) {
 			author: new PlatformAuthorLink(
 				authorId,
 				uname || symbol,
-				BASE_URL + "/coin/" + mint,
+				pumpFunAuthorProfileUrl(creator),
 				avatar || "",
 				user.followers != null ? user.followers : null
 			),
@@ -672,36 +813,17 @@ source.getVideoDetails = function (url) {
 			subtitles: [],
 		});
 	}
+	// GrayJay Desktop: grayjay-plugin-youtube sets **hls**, **live**, and **video:
+	// VideoSourceDescriptor([HLSSource])** together for live HLS so SourceAuto can resolve
+	// either muxed selection or the Live branch. Kick uses only live+empty video; that
+	// path can lose HLSSource on interop if Live does not deserialize. Mirror YouTube.
 	var hlsSource = new HLSSource({
 		name: isLive ? "Live" : "Recorded",
-		duration: -1,
+		duration: 0,
 		url: playlist,
 		priority: true,
 		requestModifier: mod,
 	});
-	if (isLive) {
-		return new PlatformVideoDetails({
-			id: new PlatformID(PLATFORM, mint, pluginId()),
-			name: title,
-			thumbnails: new Thumbnails([new Thumbnail(thumb || "", 0)]),
-			author: new PlatformAuthorLink(
-				authorId,
-				uname || symbol,
-				BASE_URL + "/coin/" + mint,
-				avatar || "",
-				user.followers != null ? user.followers : null
-			),
-			uploadDate: uploadDate,
-			url: BASE_URL + "/coin/" + mint,
-			duration: -1,
-			viewCount: 0,
-			isLive: true,
-			description: desc,
-			video: new VideoSourceDescriptor([]),
-			live: hlsSource,
-			subtitles: [],
-		});
-	}
 	return new PlatformVideoDetails({
 		id: new PlatformID(PLATFORM, mint, pluginId()),
 		name: title,
@@ -709,18 +831,19 @@ source.getVideoDetails = function (url) {
 		author: new PlatformAuthorLink(
 			authorId,
 			uname || symbol,
-			BASE_URL + "/coin/" + mint,
+			pumpFunAuthorProfileUrl(creator),
 			avatar || "",
 			user.followers != null ? user.followers : null
 		),
 		uploadDate: uploadDate,
 		url: BASE_URL + "/coin/" + mint,
-		duration: -1,
+		duration: isLive ? -1 : 0,
 		viewCount: 0,
-		isLive: false,
+		isLive: isLive,
 		description: desc,
+		hls: hlsSource,
+		live: hlsSource,
 		video: new VideoSourceDescriptor([hlsSource]),
-		live: null,
 		subtitles: [],
 	});
 };
@@ -732,23 +855,24 @@ source.isChannelUrl = function (url) {
 source.getChannel = function (url) {
 	var w = parseWalletFromProfileUrl(url);
 	if (!w) throw new ScriptException("PumpFun", "Invalid profile URL");
-	var user = httpGetJson(API_URL + "/users/" + encodeURIComponent(w));
+	var user = httpGetUserJson(w);
+	var labels = pumpFunChannelHeaderLabels(w, user);
 	return new PlatformChannel({
-		id: w,
-		name: user.username || w,
+		id: new PlatformID(PLATFORM, w, pluginId()),
+		name: labels.name,
 		thumbnail: user.profile_image || "",
 		banner: "",
 		subscribers: user.followers != null ? user.followers : 0,
-		description: user.bio || "",
+		description: labels.description,
 		url: BASE_URL + "/profile/" + w,
 		links: {},
 	});
 };
 
-source.getChannelVideos = function (url, type, order, filters) {
+source.getChannelVideos = function (url, type, order, filters, continuationToken) {
 	var w = parseWalletFromProfileUrl(url);
 	if (!w) return new VideoPager([], false, null);
-	return new PumpFunChannelCoinsPager({
+	return makePumpFunChannelCoinsPager({
 		wallet: w,
 		offset: 0,
 		pageSize: 50,
@@ -840,21 +964,28 @@ source.searchChannels = function (query) {
 		if (!resp || !resp.isOk) continue;
 		var user = {};
 		try {
-			user = JSON.parse(resp.body);
+			var sb = resp.body == null ? "" : String(resp.body).trim();
+			if (sb) user = JSON.parse(sb);
 		} catch (e) {
 			continue;
 		}
 		var uname = (user.username || "").toLowerCase();
 		var addrL = addr.toLowerCase();
 		if (!q || uname.indexOf(q) >= 0 || addrL.indexOf(q) >= 0) {
+			var listTitle =
+				(user.username && String(user.username).trim()) ||
+				pumpFunShortWalletDisplay(addr);
 			channels.push(
 				new PlatformChannel({
-					id: addr,
-					name: user.username || addr,
+					id: new PlatformID(PLATFORM, addr, pluginId()),
+					name: listTitle,
 					thumbnail: user.profile_image || "",
 					banner: "",
 					subscribers: user.followers != null ? user.followers : 0,
-					description: user.bio || "",
+					description: pumpFunChannelWalletDescription(
+						addr,
+						user.bio || ""
+					),
 					url: BASE_URL + "/profile/" + addr,
 					links: {},
 				})
@@ -877,7 +1008,7 @@ source.getComments = function (url) {
 	var cu = BASE_URL + "/coin/" + mint;
 	var eng = getOrCreateChatEngine(mint, cu);
 	eng.attachSocket();
-	return new PumpFunCommentPager([], true, { engine: eng, url: cu });
+	return makePumpFunCommentPager([], true, { engine: eng, url: cu });
 };
 
 source.getSubComments = function (comment) {
@@ -887,20 +1018,20 @@ source.getSubComments = function (comment) {
 source.getLiveEvents = function (url) {
 	var dead = { engine: null, nextRequest: 4000 };
 	var mint = parseMintFromCoinUrl(url);
-	if (!mint) return new PumpFunLiveEventPager([], false, dead);
+	if (!mint) return makePumpFunLiveEventPager([], false, dead);
 	var coin;
 	try {
 		coin = httpGetJson(API_URL + "/coins/" + encodeURIComponent(mint));
 	} catch (e) {
-		return new PumpFunLiveEventPager([], false, dead);
+		return makePumpFunLiveEventPager([], false, dead);
 	}
 	if (!coin.is_currently_live) {
-		return new PumpFunLiveEventPager([], false, dead);
+		return makePumpFunLiveEventPager([], false, dead);
 	}
 	var cu = BASE_URL + "/coin/" + mint;
 	var eng = getOrCreateChatEngine(mint, cu);
 	eng.attachSocket();
-	return new PumpFunLiveEventPager([], true, {
+	return makePumpFunLiveEventPager([], true, {
 		engine: eng,
 		nextRequest: 1200,
 	});
@@ -927,9 +1058,9 @@ source.getContentRecommendations = function (url) {
 	} catch (e) {
 		return new ContentPager([], false, null);
 	}
-	var creator = coin.creator || "";
+	var creator = creatorWalletFromField(coin.creator);
 	if (!creator) return new ContentPager([], false, null);
-	var user = httpGetJson(API_URL + "/users/" + encodeURIComponent(creator));
+	var user = httpGetUserJson(creator);
 	var b = getLiveBundle();
 	var raw = httpGetJson(
 		API_URL +
